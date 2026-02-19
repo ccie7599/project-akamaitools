@@ -1,0 +1,1079 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ============================================================================
+# akt - Akamai Toolkit
+# Unified CLI for Akamai telemetry, diagnostics, and troubleshooting
+# Combines internal tools (eSTATS, QGrep, ART, Crawly, Cracker) with
+# external tools (Akamai CLI, APIs, curl diagnostics)
+# ============================================================================
+
+readonly AKT_VERSION="1.0.0"
+
+# ---------------------------------------------------------------------------
+# Colors & Formatting
+# ---------------------------------------------------------------------------
+if [[ -t 1 ]]; then
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[0;33m'
+    BLUE='\033[0;34m'
+    MAGENTA='\033[0;35m'
+    CYAN='\033[0;36m'
+    WHITE='\033[1;37m'
+    DIM='\033[2m'
+    BOLD='\033[1m'
+    RESET='\033[0m'
+else
+    RED='' GREEN='' YELLOW='' BLUE='' MAGENTA='' CYAN='' WHITE='' DIM='' BOLD='' RESET=''
+fi
+
+info()    { echo -e "${CYAN}[info]${RESET} $*"; }
+success() { echo -e "${GREEN}[ok]${RESET} $*"; }
+warn()    { echo -e "${YELLOW}[warn]${RESET} $*"; }
+err()     { echo -e "${RED}[error]${RESET} $*" >&2; }
+header()  { echo -e "\n${BOLD}${WHITE}━━━ $* ━━━${RESET}"; }
+field()   { printf "  ${BOLD}%-28s${RESET} %s\n" "$1" "$2"; }
+dimfield(){ printf "  ${DIM}%-28s${RESET} %s\n" "$1" "$2"; }
+separator() { echo -e "${DIM}$(printf '%.0s─' {1..70})${RESET}"; }
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+EDGERC="${EDGERC:-$HOME/.edgerc}"
+EDGERC_SECTION="${AKT_SECTION:-default}"
+AKTRC="${HOME}/.aktrc"
+
+# Internal tool URLs
+ESTATS_URL="https://tools.gss.akamai.com/estats"
+ART_URL="https://tools.gss.akamai.com/art/"
+QGREP_URL="https://qssi.akamai.com"
+CRAWLY_URL="https://crawly-aps.akamai.com/#!/"
+CRACKER_URL="https://cracker-aps.akamai.com/#!/"
+
+# Akamai debug pragma headers
+AKAMAI_PRAGMAS='Pragma: akamai-x-get-cache-key, akamai-x-cache-on, akamai-x-cache-remote-on, akamai-x-get-true-cache-key, akamai-x-check-cacheable, akamai-x-get-request-id, akamai-x-serial-no, akamai-x-get-ssl-client-session-id, X-Akamai-CacheTrack, akamai-x-get-client-ip, akamai-x-feo-trace, akamai-x-tapioca-trace'
+
+# Load user config if exists
+[[ -f "$AKTRC" ]] && source "$AKTRC" 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+open_browser() {
+    local url="$1"
+    if command -v open &>/dev/null; then
+        open "$url"
+    elif command -v xdg-open &>/dev/null; then
+        xdg-open "$url"
+    else
+        info "Open in browser: $url"
+    fi
+}
+
+url_encode() {
+    python3 -c "import urllib.parse; print(urllib.parse.quote('$1', safe=''))" 2>/dev/null || echo "$1"
+}
+
+require_arg() {
+    if [[ -z "${1:-}" ]]; then
+        err "Missing required argument: $2"
+        echo "  Usage: akt $3"
+        exit 1
+    fi
+}
+
+copy_to_clipboard() {
+    if command -v pbcopy &>/dev/null; then
+        echo -n "$1" | pbcopy
+        success "Copied to clipboard"
+    elif command -v xclip &>/dev/null; then
+        echo -n "$1" | xclip -selection clipboard
+        success "Copied to clipboard"
+    fi
+}
+
+extract_ghost_ip() {
+    # Extract IP from X-Cache header like "TCP_MISS from a23-5-165-158.deploy.akamaitechnologies.com"
+    local xcache="$1"
+    local ghost_host
+    ghost_host=$(echo "$xcache" | grep -oE 'a[0-9]+-[0-9]+-[0-9]+-[0-9]+\.deploy\.akamaitechnologies\.com' | head -1)
+    if [[ -n "$ghost_host" ]]; then
+        echo "$ghost_host" | sed 's/^a//' | sed 's/\.deploy\.akamaitechnologies\.com//' | tr '-' '.'
+    fi
+}
+
+extract_cpcode_from_cachekey() {
+    # X-Cache-Key: S/D/1629/19356/000/... → cpcode is the 3rd field (index 2)
+    local cachekey="$1"
+    echo "$cachekey" | tr '/' '\n' | sed -n '3p'
+}
+
+# ---------------------------------------------------------------------------
+# akt help
+# ---------------------------------------------------------------------------
+cmd_help() {
+    cat <<EOF
+${BOLD}akt${RESET} - Akamai Toolkit v${AKT_VERSION}
+Unified CLI for Akamai telemetry, diagnostics, and troubleshooting
+
+${BOLD}DIAGNOSTICS${RESET}
+  ${GREEN}akt diag${RESET} <url>                   Full diagnostic (DNS + headers + timing)
+  ${GREEN}akt headers${RESET} <url>                Fetch & parse Akamai debug response headers
+  ${GREEN}akt dns${RESET} <hostname>               DNS resolution chain (CNAME → edge IP)
+  ${GREEN}akt edge-ip${RESET} <hostname>           Resolve hostname to edge server IP
+  ${GREEN}akt decode${RESET} <type> <value>        Decode Akamai headers (cache-key, x-cache, ref)
+
+${BOLD}INTERNAL TOOLS${RESET} ${DIM}(opens in browser)${RESET}
+  ${CYAN}akt estats${RESET} [cpcode|url]           Edge statistics & error diagnostics
+  ${CYAN}akt qgrep${RESET} <cpcode>                DDC log archive query
+  ${CYAN}akt crawly${RESET} <ref#|headers|logline> Log crawler - trace requests recursively
+  ${CYAN}akt cracker${RESET} <url>                 Universal Resource Cracker
+  ${CYAN}akt trace${RESET} <url>                   Request trace via ART (auto-extracts headers)
+
+${BOLD}AKAMAI CLI WRAPPERS${RESET}
+  ${MAGENTA}akt purge${RESET} <url|cpcode>            Purge cache (via Akamai CLI)
+  ${MAGENTA}akt gtm${RESET} [domain] [property]       GTM domain/property status
+  ${MAGENTA}akt property${RESET} <name>               Property Manager lookup
+
+${BOLD}WORKFLOWS${RESET}
+  ${YELLOW}akt troubleshoot${RESET}                  Interactive troubleshooting wizard
+
+${BOLD}OPTIONS${RESET}
+  --section <name>              edgerc section (default: default)
+  --json                        JSON output where supported
+  --help, -h                    Show this help
+
+${BOLD}QUICK REFERENCE - Akamai Headers${RESET}
+  ${DIM}X-Cache${RESET}           Ghost IP + cache status (TCP_HIT, TCP_MISS, TCP_REFRESH_HIT)
+  ${DIM}X-Cache-Key${RESET}       S|L / D|H / cpcode / serial / hostname / path
+  ${DIM}X-Cache-Remote${RESET}    Parent/midgress cache status
+  ${DIM}X-Akamai-Request-ID${RESET}  Unique request ID for log correlation
+  ${DIM}X-Check-Cacheable${RESET}   YES/NO - whether object is cacheable
+
+${BOLD}INTERNAL TOOL URLS${RESET}
+  ${DIM}eSTATS${RESET}    ${ESTATS_URL}
+  ${DIM}QGrep${RESET}     ${QGREP_URL}
+  ${DIM}ART${RESET}       ${ART_URL}
+  ${DIM}Crawly${RESET}    ${CRAWLY_URL}
+  ${DIM}Cracker${RESET}   ${CRACKER_URL}
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# akt diag <url> - Full Diagnostic
+# ---------------------------------------------------------------------------
+cmd_diag() {
+    local url="${1:-}"
+    require_arg "$url" "url" "diag <url>"
+
+    # Ensure URL has protocol
+    [[ "$url" =~ ^https?:// ]] || url="https://$url"
+    local hostname
+    hostname=$(echo "$url" | sed -E 's|https?://([^/:]+).*|\1|')
+
+    header "AKAMAI DIAGNOSTIC: $url"
+
+    # --- DNS Resolution ---
+    header "DNS Resolution"
+    local dns_output
+    dns_output=$(dig +noall +answer "$hostname" 2>/dev/null || true)
+    if [[ -n "$dns_output" ]]; then
+        local cname_chain=""
+        local final_ip=""
+        while IFS=$'\t' read -r name ttl class type value; do
+            if [[ "$type" == "CNAME" ]]; then
+                field "$name" "→ ${CYAN}$value${RESET} ${DIM}(CNAME, TTL:$ttl)${RESET}"
+                cname_chain="$value"
+            elif [[ "$type" == "A" ]]; then
+                field "$name" "→ ${GREEN}$value${RESET} ${DIM}(A, TTL:$ttl)${RESET}"
+                final_ip="$value"
+            elif [[ "$type" == "AAAA" ]]; then
+                field "$name" "→ ${GREEN}$value${RESET} ${DIM}(AAAA, TTL:$ttl)${RESET}"
+            fi
+        done <<< "$dns_output"
+
+        # Identify Akamai edge hostname
+        if echo "$cname_chain" | grep -qiE 'edgekey|edgesuite|akamaiedge|akamaitechnologies|akamaized'; then
+            success "Akamai CDN detected: $cname_chain"
+        fi
+    else
+        warn "DNS resolution failed for $hostname"
+    fi
+
+    # --- HTTP Request with Debug Headers ---
+    header "HTTP Response (with debug headers)"
+
+    local tmpfile
+    tmpfile=$(mktemp)
+    local timing_format='{"dns":"%{time_namelookup}","tcp":"%{time_connect}","ssl":"%{time_appconnect}","ttfb":"%{time_starttransfer}","total":"%{time_total}","http_code":"%{http_code}","size":"%{size_download}","speed":"%{speed_download}"}'
+
+    curl -sS -D "$tmpfile" -o /dev/null \
+        -H "$AKAMAI_PRAGMAS" \
+        -H "User-Agent: AKT/${AKT_VERSION}" \
+        -H "Accept: */*" \
+        -w "$timing_format" \
+        --connect-timeout 10 \
+        --max-time 30 \
+        "$url" 2>/dev/null > "${tmpfile}.timing" || true
+
+    local resp_headers
+    resp_headers=$(cat "$tmpfile" 2>/dev/null || echo "")
+
+    # --- Parse timing ---
+    if [[ -f "${tmpfile}.timing" ]]; then
+        local timing
+        timing=$(cat "${tmpfile}.timing")
+        local dns_time tcp_time ssl_time ttfb_time total_time http_code dl_size dl_speed
+        dns_time=$(echo "$timing" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['dns'])" 2>/dev/null || echo "?")
+        tcp_time=$(echo "$timing" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['tcp'])" 2>/dev/null || echo "?")
+        ssl_time=$(echo "$timing" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['ssl'])" 2>/dev/null || echo "?")
+        ttfb_time=$(echo "$timing" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['ttfb'])" 2>/dev/null || echo "?")
+        total_time=$(echo "$timing" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['total'])" 2>/dev/null || echo "?")
+        http_code=$(echo "$timing" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['http_code'])" 2>/dev/null || echo "?")
+        dl_size=$(echo "$timing" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['size'])" 2>/dev/null || echo "?")
+
+        header "Timing Breakdown"
+        field "DNS Lookup" "${dns_time}s"
+        field "TCP Connect" "${tcp_time}s"
+        field "SSL Handshake" "${ssl_time}s"
+        field "TTFB" "${ttfb_time}s"
+        field "Total Time" "${BOLD}${total_time}s${RESET}"
+
+        # Color-code HTTP status
+        local status_color="$GREEN"
+        [[ "$http_code" =~ ^[45] ]] && status_color="$RED"
+        [[ "$http_code" =~ ^3 ]] && status_color="$YELLOW"
+        field "HTTP Status" "${status_color}${http_code}${RESET}"
+        field "Download Size" "${dl_size} bytes"
+    fi
+
+    # --- Parse Akamai Headers ---
+    if [[ -n "$resp_headers" ]]; then
+        header "Akamai Headers"
+
+        local xcache xcache_key xcache_remote request_id check_cacheable true_cache_key serial_no
+        xcache=$(echo "$resp_headers" | grep -i '^X-Cache:' | head -1 | sed 's/^[^:]*: //' | tr -d '\r' || true)
+        xcache_key=$(echo "$resp_headers" | grep -i '^X-Cache-Key:' | head -1 | sed 's/^[^:]*: //' | tr -d '\r' || true)
+        xcache_remote=$(echo "$resp_headers" | grep -i '^X-Cache-Remote:' | head -1 | sed 's/^[^:]*: //' | tr -d '\r' || true)
+        request_id=$(echo "$resp_headers" | grep -i '^X-Akamai-Request-ID:' | head -1 | sed 's/^[^:]*: //' | tr -d '\r' || true)
+        check_cacheable=$(echo "$resp_headers" | grep -i '^X-Check-Cacheable:' | head -1 | sed 's/^[^:]*: //' | tr -d '\r' || true)
+        true_cache_key=$(echo "$resp_headers" | grep -i '^X-True-Cache-Key:' | head -1 | sed 's/^[^:]*: //' | tr -d '\r' || true)
+        serial_no=$(echo "$resp_headers" | grep -i '^X-Serial:' | head -1 | sed 's/^[^:]*: //' | tr -d '\r' || true)
+
+        # X-Cache analysis
+        if [[ -n "$xcache" ]]; then
+            local cache_status="UNKNOWN"
+            local cache_color="$YELLOW"
+            if echo "$xcache" | grep -qi "TCP_HIT"; then
+                cache_status="HIT (served from edge cache)"
+                cache_color="$GREEN"
+            elif echo "$xcache" | grep -qi "TCP_MISS"; then
+                cache_status="MISS (fetched from origin)"
+                cache_color="$RED"
+            elif echo "$xcache" | grep -qi "TCP_REFRESH_HIT"; then
+                cache_status="REFRESH HIT (revalidated, served from cache)"
+                cache_color="$GREEN"
+            elif echo "$xcache" | grep -qi "TCP_REFRESH_MISS"; then
+                cache_status="REFRESH MISS (revalidated, fetched new)"
+                cache_color="$YELLOW"
+            elif echo "$xcache" | grep -qi "TCP_MEM_HIT"; then
+                cache_status="MEMORY HIT (served from memory cache)"
+                cache_color="$GREEN"
+            elif echo "$xcache" | grep -qi "TCP_DENIED"; then
+                cache_status="DENIED (blocked by configuration)"
+                cache_color="$RED"
+            fi
+            field "Cache Status" "${cache_color}${cache_status}${RESET}"
+
+            local ghost_ip
+            ghost_ip=$(extract_ghost_ip "$xcache")
+            [[ -n "$ghost_ip" ]] && field "Edge Ghost IP" "$ghost_ip"
+            field "X-Cache" "$xcache"
+        fi
+
+        # X-Cache-Remote (parent)
+        if [[ -n "$xcache_remote" ]]; then
+            local parent_ip
+            parent_ip=$(extract_ghost_ip "$xcache_remote")
+            field "X-Cache-Remote" "$xcache_remote"
+            [[ -n "$parent_ip" ]] && field "Parent Ghost IP" "$parent_ip"
+        fi
+
+        # Cache Key analysis
+        if [[ -n "$xcache_key" ]]; then
+            field "X-Cache-Key" "$xcache_key"
+            local cpcode
+            cpcode=$(extract_cpcode_from_cachekey "$xcache_key")
+            [[ -n "$cpcode" ]] && field "CP Code" "${BOLD}${cpcode}${RESET}"
+
+            # Extract origin hostname from cache key (first field with a dot after cpcode/serial)
+            local origin_host=""
+            local _ck_parts
+            IFS='/' read -ra _ck_parts <<< "$xcache_key"
+            for ((idx=4; idx<${#_ck_parts[@]}; idx++)); do
+                if [[ "${_ck_parts[$idx]}" == *.* ]]; then
+                    origin_host="${_ck_parts[$idx]}"
+                    break
+                fi
+            done
+            [[ -n "$origin_host" ]] && field "Origin Hostname" "$origin_host"
+        fi
+
+        [[ -n "$true_cache_key" ]] && field "X-True-Cache-Key" "$true_cache_key"
+        [[ -n "$request_id" ]] && field "Request ID" "${BOLD}${request_id}${RESET}"
+        [[ -n "$check_cacheable" ]] && field "Cacheable" "$check_cacheable"
+        [[ -n "$serial_no" ]] && field "Serial Number" "$serial_no"
+
+        # Show Akamai session info headers
+        local session_info
+        session_info=$(echo "$resp_headers" | grep -i '^X-Akamai-Session-Info:' | sed 's/^[^:]*: //' | tr -d '\r' || true)
+        if [[ -n "$session_info" ]]; then
+            header "Session Info"
+            while IFS= read -r line; do
+                local name value
+                name=$(echo "$line" | sed -n 's/.*name=\([^;]*\).*/\1/p')
+                value=$(echo "$line" | sed -n 's/.*value=\(.*\)/\1/p')
+                [[ -z "$value" ]] && value="$line"
+                if [[ -n "$name" ]]; then
+                    dimfield "$name" "$value"
+                else
+                    dimfield "session-info" "$line"
+                fi
+            done <<< "$session_info"
+        fi
+
+        # --- Quick Actions ---
+        header "Quick Actions"
+        local cpcode_for_actions=""
+        [[ -n "${cpcode:-}" ]] && cpcode_for_actions="$cpcode"
+        [[ -n "${request_id:-}" ]] && info "Trace in ART:     ${DIM}akt trace $url${RESET}"
+        [[ -n "${request_id:-}" ]] && info "Crawl logs:       ${DIM}akt crawly $request_id${RESET}"
+        [[ -n "$cpcode_for_actions" ]] && info "Edge stats:       ${DIM}akt estats $cpcode_for_actions${RESET}"
+        [[ -n "$cpcode_for_actions" ]] && info "Archive logs:     ${DIM}akt qgrep $cpcode_for_actions${RESET}"
+        info "Test in Cracker:  ${DIM}akt cracker $url${RESET}"
+    fi
+
+    rm -f "$tmpfile" "${tmpfile}.timing" 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
+# akt headers <url> - Debug Header Fetch
+# ---------------------------------------------------------------------------
+cmd_headers() {
+    local url="${1:-}"
+    require_arg "$url" "url" "headers <url>"
+    [[ "$url" =~ ^https?:// ]] || url="https://$url"
+
+    header "Akamai Debug Headers: $url"
+
+    local resp
+    resp=$(curl -sS -I \
+        -H "$AKAMAI_PRAGMAS" \
+        -H "User-Agent: AKT/${AKT_VERSION}" \
+        --connect-timeout 10 \
+        --max-time 30 \
+        "$url" 2>/dev/null || true)
+
+    if [[ -z "$resp" ]]; then
+        err "No response from $url"
+        return 1
+    fi
+
+    # Show all headers, highlighting Akamai-specific ones
+    while IFS= read -r line; do
+        line=$(echo "$line" | tr -d '\r')
+        [[ -z "$line" ]] && continue
+        if echo "$line" | grep -qiE '^(X-Cache|X-Akamai|X-Check|X-True-Cache|X-Serial|X-Cache-Key|X-Cache-Remote)'; then
+            echo -e "  ${GREEN}${BOLD}${line}${RESET}"
+        elif echo "$line" | grep -qiE '^HTTP/'; then
+            echo -e "  ${CYAN}${BOLD}${line}${RESET}"
+        else
+            echo -e "  ${DIM}${line}${RESET}"
+        fi
+    done <<< "$resp"
+}
+
+# ---------------------------------------------------------------------------
+# akt dns <hostname> - DNS Chain Resolution
+# ---------------------------------------------------------------------------
+cmd_dns() {
+    local hostname="${1:-}"
+    require_arg "$hostname" "hostname" "dns <hostname>"
+
+    # Strip protocol if provided
+    hostname=$(echo "$hostname" | sed -E 's|https?://||' | sed 's|/.*||')
+
+    header "DNS Resolution Chain: $hostname"
+
+    local current="$hostname"
+    local step=1
+    local seen=""
+
+    while true; do
+        # Prevent infinite loops
+        if echo "$seen" | grep -qF "$current"; then
+            break
+        fi
+        seen="$seen $current"
+
+        local result
+        result=$(dig +short "$current" 2>/dev/null | head -5)
+
+        if [[ -z "$result" ]]; then
+            field "Step $step" "${RED}No DNS records for $current${RESET}"
+            break
+        fi
+
+        local has_cname=false
+        while IFS= read -r record; do
+            record=$(echo "$record" | tr -d '\r\n')
+            [[ -z "$record" ]] && continue
+
+            if echo "$record" | grep -qE '\.$'; then
+                # CNAME (ends with .)
+                has_cname=true
+                local label=""
+                if echo "$record" | grep -qiE 'edgekey\.net'; then
+                    label="${CYAN}(Akamai Edgekey)${RESET}"
+                elif echo "$record" | grep -qiE 'edgesuite\.net'; then
+                    label="${CYAN}(Akamai Edgesuite)${RESET}"
+                elif echo "$record" | grep -qiE 'akamaiedge\.net'; then
+                    label="${CYAN}(Akamai Edge Map)${RESET}"
+                elif echo "$record" | grep -qiE 'akamaitechnologies\.com'; then
+                    label="${CYAN}(Akamai Ghost)${RESET}"
+                elif echo "$record" | grep -qiE 'akamaized\.net'; then
+                    label="${CYAN}(Akamaized)${RESET}"
+                elif echo "$record" | grep -qiE 'akamai\.net'; then
+                    label="${CYAN}(Akamai)${RESET}"
+                fi
+                field "Step $step  $current" "CNAME → ${YELLOW}${record}${RESET} $label"
+                current="${record%.}"  # Remove trailing dot
+                step=$((step + 1))
+            elif echo "$record" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+                # IPv4
+                field "Step $step  $current" "A     → ${GREEN}${record}${RESET}"
+            elif echo "$record" | grep -qE ':'; then
+                # IPv6
+                field "Step $step  $current" "AAAA  → ${GREEN}${record}${RESET}"
+            fi
+        done <<< "$result"
+
+        # If no CNAME was found (only A/AAAA records), we're done
+        if ! $has_cname; then
+            break
+        fi
+    done
+
+    # Show TTL info
+    separator
+    local ttl_info
+    ttl_info=$(dig +noall +answer "$hostname" 2>/dev/null | head -5)
+    if [[ -n "$ttl_info" ]]; then
+        info "TTL Details:"
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            echo -e "  ${DIM}$line${RESET}"
+        done <<< "$ttl_info"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# akt edge-ip <hostname> - Edge IP Lookup
+# ---------------------------------------------------------------------------
+cmd_edge_ip() {
+    local hostname="${1:-}"
+    require_arg "$hostname" "hostname" "edge-ip <hostname>"
+    hostname=$(echo "$hostname" | sed -E 's|https?://||' | sed 's|/.*||')
+
+    header "Edge IP Lookup: $hostname"
+
+    # Get edge IPs
+    local ips
+    ips=$(dig +short "$hostname" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -5)
+
+    if [[ -z "$ips" ]]; then
+        err "Could not resolve $hostname"
+        return 1
+    fi
+
+    while IFS= read -r ip; do
+        [[ -z "$ip" ]] && continue
+        field "Edge IP" "${GREEN}$ip${RESET}"
+
+        # Reverse lookup
+        local rdns
+        rdns=$(dig +short -x "$ip" 2>/dev/null | head -1)
+        if [[ -n "$rdns" ]]; then
+            field "  Reverse DNS" "$rdns"
+            # Decode Akamai ghost hostname (aXXX-YY-ZZ-WW.deploy.akamaitechnologies.com)
+            if echo "$rdns" | grep -qi 'akamaitechnologies.com'; then
+                success "  Confirmed Akamai edge server"
+            fi
+        fi
+    done <<< "$ips"
+}
+
+# ---------------------------------------------------------------------------
+# akt decode <type> <value> - Header Decoder
+# ---------------------------------------------------------------------------
+cmd_decode() {
+    local type="${1:-}"
+    local value="${2:-}"
+    require_arg "$type" "type" "decode <cache-key|x-cache|ref> <value>"
+    require_arg "$value" "value" "decode $type <value>"
+
+    case "$type" in
+        cache-key|cachekey|ck)
+            header "Cache Key Decode"
+            # Format: S/D/cpcode/serial/[sub]/hostname/path?query
+            # Some keys have extra numeric fields between serial and hostname
+            local parts
+            IFS='/' read -ra parts <<< "$value"
+            local storage_type="${parts[0]:-?}"
+            local delivery="${parts[1]:-?}"
+            local cpcode="${parts[2]:-?}"
+            local serial="${parts[3]:-?}"
+
+            field "Storage Type" "$storage_type ${DIM}(S=secure, L=non-secure)${RESET}"
+            field "Delivery Type" "$delivery ${DIM}(D=download, H=HTTP streaming)${RESET}"
+            field "CP Code" "${BOLD}$cpcode${RESET}"
+            field "Serial Number" "$serial"
+
+            # Find hostname: first field after serial that contains a dot (hostname)
+            local host_idx=4
+            while [[ $host_idx -lt ${#parts[@]} ]] && [[ "${parts[$host_idx]}" != *.* ]]; do
+                host_idx=$((host_idx + 1))
+            done
+
+            # Reconstruct hostname and path from host_idx onward
+            local remaining=""
+            for ((i=host_idx; i<${#parts[@]}; i++)); do
+                [[ -n "$remaining" ]] && remaining="$remaining/"
+                remaining="$remaining${parts[$i]}"
+            done
+            if [[ -n "$remaining" ]]; then
+                local ck_host
+                ck_host=$(echo "$remaining" | cut -d'/' -f1)
+                local ck_path
+                ck_path=$(echo "$remaining" | cut -d'/' -f2-)
+                field "Hostname" "$ck_host"
+                [[ -n "$ck_path" ]] && field "Path" "/$ck_path"
+            fi
+
+            # Extract vcd if present
+            local vcd
+            vcd=$(echo "$value" | sed -n 's/.*vcd=\([0-9]*\).*/\1/p')
+            [[ -n "$vcd" ]] && field "VCD (Version)" "$vcd"
+            ;;
+
+        x-cache|xcache|xc)
+            header "X-Cache Decode"
+            local status_part
+            status_part=$(echo "$value" | awk '{print $1}')
+            field "Cache Status" "$status_part"
+
+            case "$status_part" in
+                TCP_HIT)      field "Meaning" "${GREEN}Served from edge cache${RESET}" ;;
+                TCP_MISS)     field "Meaning" "${RED}Fetched from origin${RESET}" ;;
+                TCP_REFRESH_HIT)   field "Meaning" "${GREEN}Revalidated, served from cache (304)${RESET}" ;;
+                TCP_REFRESH_MISS)  field "Meaning" "${YELLOW}Revalidated, new content from origin${RESET}" ;;
+                TCP_MEM_HIT)  field "Meaning" "${GREEN}Served from memory cache${RESET}" ;;
+                TCP_DENIED)   field "Meaning" "${RED}Request denied by configuration${RESET}" ;;
+                TCP_ERR*)     field "Meaning" "${RED}Error during request processing${RESET}" ;;
+                *)            field "Meaning" "Unknown status" ;;
+            esac
+
+            local ghost_ip
+            ghost_ip=$(extract_ghost_ip "$value")
+            [[ -n "$ghost_ip" ]] && field "Ghost IP" "$ghost_ip"
+
+            # Extract GHost version
+            local ghost_ver
+            ghost_ver=$(echo "$value" | sed -n 's/.*AkamaiGHost\/\([^ )]*\).*/\1/p')
+            [[ -n "$ghost_ver" ]] && field "GHost Version" "$ghost_ver"
+            ;;
+
+        ref|reference)
+            header "Reference Number Decode"
+            # Format: #18.a4a50517.1490847914.52e002
+            local ref_clean
+            ref_clean=$(echo "$value" | sed 's/^#//')
+            IFS='.' read -ra ref_parts <<< "$ref_clean"
+            field "Error Type ID" "${ref_parts[0]:-?}"
+            field "Ghost Identifier" "${ref_parts[1]:-?}"
+            if [[ -n "${ref_parts[2]:-}" ]]; then
+                local unix_ts="${ref_parts[2]}"
+                local human_ts
+                human_ts=$(date -r "$unix_ts" 2>/dev/null || date -d "@$unix_ts" 2>/dev/null || echo "?")
+                field "Timestamp (Unix)" "$unix_ts"
+                field "Timestamp (Human)" "$human_ts"
+            fi
+            [[ -n "${ref_parts[3]:-}" ]] && field "Request ID" "${ref_parts[3]}"
+            separator
+            info "Crawl logs: ${DIM}akt crawly $value${RESET}"
+            ;;
+
+        *)
+            err "Unknown decode type: $type"
+            echo "  Supported types: cache-key, x-cache, ref"
+            return 1
+            ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# akt trace <url> - Request Trace via ART
+# ---------------------------------------------------------------------------
+cmd_trace() {
+    local url="${1:-}"
+    require_arg "$url" "url" "trace <url>"
+    [[ "$url" =~ ^https?:// ]] || url="https://$url"
+
+    header "Request Trace: $url"
+    info "Fetching response headers..."
+
+    local resp
+    resp=$(curl -sS -I \
+        -H "$AKAMAI_PRAGMAS" \
+        -H "User-Agent: AKT/${AKT_VERSION}" \
+        --connect-timeout 10 \
+        --max-time 30 \
+        "$url" 2>/dev/null || true)
+
+    if [[ -z "$resp" ]]; then
+        err "No response from $url"
+        return 1
+    fi
+
+    # Extract key headers for ART
+    local xcache request_id date_header
+    xcache=$(echo "$resp" | grep -i '^X-Cache:' | head -1 | tr -d '\r' || true)
+    request_id=$(echo "$resp" | grep -i '^X-Akamai-Request-ID:' | head -1 | tr -d '\r' || true)
+    date_header=$(echo "$resp" | grep -i '^Date:' | head -1 | tr -d '\r' || true)
+
+    if [[ -z "$xcache" || -z "$request_id" ]]; then
+        warn "Missing required ART headers (X-Cache or X-Akamai-Request-ID)"
+        warn "This URL may not be served by Akamai, or debug headers are disabled"
+        echo ""
+        info "Headers received:"
+        echo "$resp" | head -20
+        return 1
+    fi
+
+    field "X-Cache" "$xcache"
+    field "Request-ID" "$request_id"
+    field "Date" "$date_header"
+
+    # Copy headers to clipboard for pasting into ART
+    local art_input="$resp"
+    copy_to_clipboard "$art_input"
+
+    separator
+    info "Response headers copied to clipboard"
+    info "Opening ART - paste headers into the input box"
+    open_browser "$ART_URL"
+}
+
+# ---------------------------------------------------------------------------
+# akt estats [cpcode|url] - Edge Statistics
+# ---------------------------------------------------------------------------
+cmd_estats() {
+    local input="${1:-}"
+    local network="${AKT_ESTATS_NETWORK:-essl}"
+    local type="${AKT_ESTATS_TYPE:-errors}"
+
+    # Parse flags
+    shift || true
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --network) network="${2:-essl}"; shift 2 ;;
+            --type)    type="${2:-errors}"; shift 2 ;;
+            *)         shift ;;
+        esac
+    done
+
+    header "eSTATS - Edge Statistics"
+
+    # If input looks like a URL, extract CP code first
+    if [[ "$input" =~ ^https?:// ]] || [[ "$input" == *"."* && ! "$input" =~ ^[0-9]+$ ]]; then
+        info "Extracting CP code from URL..."
+        [[ "$input" =~ ^https?:// ]] || input="https://$input"
+        local resp
+        resp=$(curl -sS -I -H "$AKAMAI_PRAGMAS" --connect-timeout 10 --max-time 15 "$input" 2>/dev/null || true)
+        local cachekey
+        cachekey=$(echo "$resp" | grep -i '^X-Cache-Key:' | head -1 | sed 's/^[^:]*: //' | tr -d '\r' || true)
+        if [[ -n "$cachekey" ]]; then
+            input=$(extract_cpcode_from_cachekey "$cachekey")
+            success "CP Code: $input"
+        else
+            warn "Could not extract CP code. Opening eSTATS without pre-fill."
+            input=""
+        fi
+    fi
+
+    if [[ -n "$input" ]]; then
+        field "CP Code" "$input"
+    fi
+    field "Network" "$network"
+    field "Type" "$type"
+
+    separator
+    info "Opening eSTATS in browser..."
+    info "${DIM}Use Cases: error severity, live server errors, regional patterns, DOS investigation, go-live monitoring${RESET}"
+    info "${DIM}Networks: fflow, essl, flash, mega (all networks - slow), sqa, ighost${RESET}"
+    open_browser "$ESTATS_URL"
+}
+
+# ---------------------------------------------------------------------------
+# akt qgrep <cpcode> - DDC Log Archive Query
+# ---------------------------------------------------------------------------
+cmd_qgrep() {
+    local cpcode="${1:-}"
+    require_arg "$cpcode" "cpcode" "qgrep <cpcode> [--hours N] [--ghost-ip X]"
+
+    local hours="1"
+    local ghost_ip=""
+
+    shift || true
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --hours)    hours="${2:-1}"; shift 2 ;;
+            --ghost-ip) ghost_ip="${2:-}"; shift 2 ;;
+            *)          shift ;;
+        esac
+    done
+
+    header "QGrep - DDC Log Archive"
+    field "CP Code" "$cpcode"
+    field "Duration" "${hours} hour(s)"
+    [[ -n "$ghost_ip" ]] && field "Ghost IP" "$ghost_ip"
+
+    separator
+    warn "Reminders:"
+    echo -e "  ${DIM}- Archive retention: 14 days${RESET}"
+    echo -e "  ${DIM}- Typical retrieval time: ~12 minutes${RESET}"
+    echo -e "  ${DIM}- Data available ~15 min after DDC receives from ghost${RESET}"
+    echo -e "  ${DIM}- Networks supported: FF (FreeFlow) and ESSL${RESET}"
+    echo -e "  ${DIM}- Max logs per query: check Help page for current limits${RESET}"
+    echo -e "  ${DIM}- Quota: sliding window per user${RESET}"
+
+    separator
+    info "Opening QGrep in browser..."
+    open_browser "$QGREP_URL"
+}
+
+# ---------------------------------------------------------------------------
+# akt crawly <input> - Log Crawler
+# ---------------------------------------------------------------------------
+cmd_crawly() {
+    local input="${*:-}"
+    require_arg "$input" "input" "crawly <reference#|headers|logline>"
+
+    header "Crawly - Log Crawler"
+
+    # Detect input type
+    if echo "$input" | grep -qE '^#?[0-9]+\.[a-f0-9]+\.[0-9]+'; then
+        info "Detected: Reference number"
+    elif echo "$input" | grep -qE '^X-'; then
+        info "Detected: Response headers"
+    elif echo "$input" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+'; then
+        info "Detected: Log line with IP"
+    elif echo "$input" | grep -qE '^[a-f0-9]{24}$'; then
+        info "Detected: Cloudmon ID"
+    else
+        info "Detected: Generic input"
+    fi
+
+    # URL-encode and open Crawly with pre-filled input
+    local encoded
+    encoded=$(url_encode "$input")
+    local crawly_url="${CRAWLY_URL}?crawl-input=${encoded}"
+
+    separator
+    info "Opening Crawly with pre-filled input..."
+    info "${DIM}Crawly traces requests recursively from edge → parent → origin${RESET}"
+    info "${DIM}Supports: log lines, reference numbers, response headers, cloudmon IDs${RESET}"
+    open_browser "$crawly_url"
+}
+
+# ---------------------------------------------------------------------------
+# akt cracker <url> - Universal Resource Cracker
+# ---------------------------------------------------------------------------
+cmd_cracker() {
+    local url="${1:-}"
+    require_arg "$url" "url" "cracker <url>"
+    [[ "$url" =~ ^https?:// ]] || url="https://$url"
+
+    local staging=false
+    shift || true
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --staging) staging=true; shift ;;
+            *)         shift ;;
+        esac
+    done
+
+    header "Cracker - Universal Resource Cracker"
+    field "URL" "$url"
+    $staging && field "Environment" "Staging" || field "Environment" "Production"
+
+    separator
+    info "Features available in Cracker:"
+    echo -e "  ${DIM}- Response headers, cache settings, CP code${RESET}"
+    echo -e "  ${DIM}- DNS resolution path${RESET}"
+    echo -e "  ${DIM}- Metadata trace (arl.data)${RESET}"
+    echo -e "  ${DIM}- Traffic tools (eSTATS, IP)${RESET}"
+    echo -e "  ${DIM}- Diagnostics (Ping, MTR, Dig, Cert)${RESET}"
+    echo -e "  ${DIM}- SSL slot settings & monitor${RESET}"
+    echo -e "  ${DIM}- Cache purge (server & ESN)${RESET}"
+    echo -e "  ${DIM}- Auto log crawl via Crawly${RESET}"
+
+    separator
+    info "Opening Cracker in browser..."
+    open_browser "$CRACKER_URL"
+}
+
+# ---------------------------------------------------------------------------
+# akt purge <url|cpcode> - Cache Purge
+# ---------------------------------------------------------------------------
+cmd_purge() {
+    local target="${1:-}"
+    require_arg "$target" "url or cpcode" "purge <url|cpcode> [--staging]"
+
+    local network="production"
+    shift || true
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --staging)    network="staging"; shift ;;
+            --production) network="production"; shift ;;
+            *)            shift ;;
+        esac
+    done
+
+    header "Cache Purge"
+    field "Target" "$target"
+    field "Network" "$network"
+
+    if ! command -v akamai &>/dev/null; then
+        err "Akamai CLI not found. Install with: brew install akamai"
+        return 1
+    fi
+
+    separator
+    warn "This will invalidate cached content."
+    echo -n "  Continue? [y/N] "
+    read -r confirm
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+        info "Cancelled"
+        return 0
+    fi
+
+    if [[ "$target" =~ ^[0-9]+$ ]]; then
+        info "Purging by CP code: $target"
+        akamai purge invalidate --cpcode "$target" --network "$network" --edgerc "$EDGERC" --section "$EDGERC_SECTION"
+    else
+        info "Purging by URL: $target"
+        akamai purge invalidate "$target" --network "$network" --edgerc "$EDGERC" --section "$EDGERC_SECTION"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# akt gtm [domain] [property] - GTM Status
+# ---------------------------------------------------------------------------
+cmd_gtm() {
+    local domain="${1:-}"
+    local property="${2:-}"
+
+    header "GTM - Global Traffic Management"
+
+    if ! command -v akamai &>/dev/null; then
+        err "Akamai CLI not found. Install with: brew install akamai"
+        return 1
+    fi
+
+    if [[ -z "$domain" ]]; then
+        info "Listing GTM domains..."
+        akamai gtm --edgerc "$EDGERC" --section "$EDGERC_SECTION" list-domains 2>/dev/null || warn "GTM CLI command failed. Check edgerc config."
+    elif [[ -z "$property" ]]; then
+        info "Listing properties for domain: $domain"
+        akamai gtm --edgerc "$EDGERC" --section "$EDGERC_SECTION" list-properties --domain "$domain" 2>/dev/null || warn "GTM CLI command failed."
+    else
+        info "Getting property: $property in domain: $domain"
+        akamai gtm --edgerc "$EDGERC" --section "$EDGERC_SECTION" get-property --domain "$domain" --property "$property" 2>/dev/null || warn "GTM CLI command failed."
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# akt property <name> - Property Manager Lookup
+# ---------------------------------------------------------------------------
+cmd_property() {
+    local name="${1:-}"
+    require_arg "$name" "property name" "property <name>"
+
+    header "Property Manager: $name"
+
+    if ! command -v akamai &>/dev/null; then
+        err "Akamai CLI not found"
+        return 1
+    fi
+
+    info "Searching for property: $name"
+    akamai property-manager --edgerc "$EDGERC" --section "$EDGERC_SECTION" search "$name" 2>/dev/null || warn "Property Manager CLI command failed."
+}
+
+# ---------------------------------------------------------------------------
+# akt troubleshoot - Interactive Wizard
+# ---------------------------------------------------------------------------
+cmd_troubleshoot() {
+    header "Akamai Troubleshooting Wizard"
+    echo ""
+    echo -e "  ${BOLD}What are you troubleshooting?${RESET}"
+    echo ""
+    echo -e "  ${GREEN}1${RESET}) Slow response times"
+    echo -e "  ${GREEN}2${RESET}) Error responses (4xx/5xx)"
+    echo -e "  ${GREEN}3${RESET}) Cache issues (unexpected MISS/HIT)"
+    echo -e "  ${GREEN}4${RESET}) DNS resolution problems"
+    echo -e "  ${GREEN}5${RESET}) Origin connectivity issues"
+    echo -e "  ${GREEN}6${RESET}) Go-live monitoring"
+    echo -e "  ${GREEN}7${RESET}) SSL/TLS certificate issues"
+    echo ""
+    echo -n "  Select [1-7]: "
+    read -r choice
+
+    case "$choice" in
+        1)
+            echo -n "  Enter URL: "
+            read -r url
+            info "Running full diagnostic..."
+            cmd_diag "$url"
+            separator
+            info "Next steps:"
+            echo -e "  ${DIM}1. Check TTFB - if high, origin may be slow${RESET}"
+            echo -e "  ${DIM}2. Check cache status - MISS means going to origin every time${RESET}"
+            echo -e "  ${DIM}3. Check midgress - X-Cache-Remote shows parent cache status${RESET}"
+            echo -e "  ${DIM}4. Use eSTATS to check for regional patterns${RESET}"
+            echo -e "  ${DIM}5. Use Crawly to trace the full request path${RESET}"
+            ;;
+        2)
+            echo -n "  Enter URL or reference number: "
+            read -r input
+            if echo "$input" | grep -qE '^#?[0-9]+\.'; then
+                info "Crawling logs for reference number..."
+                cmd_crawly "$input"
+            else
+                info "Running diagnostic..."
+                cmd_diag "$input"
+                separator
+                info "Next steps:"
+                echo -e "  ${DIM}1. Check HTTP status code${RESET}"
+                echo -e "  ${DIM}2. If reference # in error page → akt crawly <ref#>${RESET}"
+                echo -e "  ${DIM}3. Use eSTATS to check error patterns by region${RESET}"
+                echo -e "  ${DIM}4. Check origin errors vs edge errors${RESET}"
+            fi
+            ;;
+        3)
+            echo -n "  Enter URL: "
+            read -r url
+            info "Fetching cache headers..."
+            cmd_headers "$url"
+            separator
+            info "Cache Analysis Tips:"
+            echo -e "  ${DIM}1. X-Check-Cacheable: YES/NO - is the object configured as cacheable?${RESET}"
+            echo -e "  ${DIM}2. X-Cache: TCP_HIT = cached, TCP_MISS = went to origin${RESET}"
+            echo -e "  ${DIM}3. Compare X-Cache-Key vs X-True-Cache-Key for query string caching${RESET}"
+            echo -e "  ${DIM}4. Check Vary header for cache fragmentation${RESET}"
+            echo -e "  ${DIM}5. Check Cache-Control/max-age from origin${RESET}"
+            ;;
+        4)
+            echo -n "  Enter hostname: "
+            read -r hostname
+            cmd_dns "$hostname"
+            ;;
+        5)
+            echo -n "  Enter URL: "
+            read -r url
+            info "Running origin-focused diagnostic..."
+            cmd_diag "$url"
+            separator
+            info "Origin Investigation:"
+            echo -e "  ${DIM}1. Check X-Cache-Remote for parent → origin path${RESET}"
+            echo -e "  ${DIM}2. High TTFB with cache MISS = slow origin${RESET}"
+            echo -e "  ${DIM}3. Use eSTATS with 'Origin Errors' type${RESET}"
+            echo -e "  ${DIM}4. Use Crawly to see exact origin response codes${RESET}"
+            ;;
+        6)
+            echo -n "  Enter CP code or URL: "
+            read -r input
+            info "Opening eSTATS for go-live monitoring..."
+            echo -e "  ${DIM}Tip: Use 'Edge Hits' type and 'automatic refresh' in eSTATS${RESET}"
+            echo -e "  ${DIM}Watch for edge hits arriving and keep eye on origin/edge errors${RESET}"
+            cmd_estats "$input"
+            ;;
+        7)
+            echo -n "  Enter hostname: "
+            read -r hostname
+            info "Checking SSL certificate..."
+            [[ "$hostname" =~ ^https?:// ]] && hostname=$(echo "$hostname" | sed -E 's|https?://||' | sed 's|/.*||')
+            echo | openssl s_client -connect "${hostname}:443" -servername "$hostname" 2>/dev/null | openssl x509 -noout -text 2>/dev/null | grep -E '(Subject:|Issuer:|Not Before|Not After|DNS:)' | head -20
+            ;;
+        *)
+            warn "Invalid choice"
+            ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# Main Dispatch
+# ---------------------------------------------------------------------------
+main() {
+    # Parse global flags
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --section)
+                EDGERC_SECTION="${2:-default}"
+                shift 2
+                ;;
+            --help|-h)
+                cmd_help
+                exit 0
+                ;;
+            --version|-v)
+                echo "akt version ${AKT_VERSION}"
+                exit 0
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+
+    local cmd="${1:-help}"
+    shift || true
+
+    case "$cmd" in
+        diag|diagnose|diagnostic)   cmd_diag "$@" ;;
+        headers|hdr|head)           cmd_headers "$@" ;;
+        dns)                        cmd_dns "$@" ;;
+        edge-ip|edgeip|eip)         cmd_edge_ip "$@" ;;
+        decode|dec)                 cmd_decode "$@" ;;
+        trace|art)                  cmd_trace "$@" ;;
+        estats|es)                  cmd_estats "$@" ;;
+        qgrep|qg)                   cmd_qgrep "$@" ;;
+        crawly|crawl|cr)            cmd_crawly "$@" ;;
+        cracker|crack|ck)           cmd_cracker "$@" ;;
+        purge)                      cmd_purge "$@" ;;
+        gtm)                        cmd_gtm "$@" ;;
+        property|prop|pm)           cmd_property "$@" ;;
+        troubleshoot|ts|wizard)     cmd_troubleshoot ;;
+        help|--help|-h)             cmd_help ;;
+        *)
+            err "Unknown command: $cmd"
+            echo ""
+            cmd_help
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
